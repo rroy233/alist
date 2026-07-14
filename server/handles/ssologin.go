@@ -23,6 +23,7 @@ import (
 	"github.com/coreos/go-oidc"
 	"github.com/gin-gonic/gin"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
@@ -156,13 +157,21 @@ func autoRegister(username, userID string, err error) (*model.User, error) {
 	if username == "" {
 		return nil, errors.New("cannot get username from SSO provider")
 	}
+	defaultRoleID := op.GetDefaultRoleID()
+	defaultRole, err := op.GetRole(uint(defaultRoleID))
+	if err != nil {
+		return nil, fmt.Errorf("cannot load default role for SSO auto-registration: %w", err)
+	}
+	if defaultRole.Name == "guest" || defaultRole.Name == "admin" {
+		return nil, errors.New("SSO auto-registration requires a non-guest, non-admin default role")
+	}
 	user := &model.User{
 		ID:         0,
 		Username:   username,
 		Password:   random.String(16),
 		Permission: int32(setting.GetInt(conf.SSODefaultPermission, 0)),
 		BasePath:   setting.GetStr(conf.SSODefaultDir),
-		Role:       model.Roles{op.GetDefaultRoleID()},
+		Role:       model.Roles{defaultRoleID},
 		Disabled:   false,
 		SsoID:      userID,
 	}
@@ -364,6 +373,7 @@ func SSOLoginCallback(c *gin.Context) {
 	callbackCode := c.Query(authField)
 	if callbackCode == "" {
 		if platform == "Feishu" && c.Query("error") != "" {
+			log.Warnf("Feishu SSO authorization callback returned error=%q", c.Query("error"))
 			common.ErrorStrResp(c, "Feishu authorization failed: "+c.Query("error"), 400)
 			return
 		}
@@ -371,6 +381,7 @@ func SSOLoginCallback(c *gin.Context) {
 		return
 	}
 	if platform == "Feishu" && !verifyState(clientId, c.ClientIP(), c.Query("state")) {
+		log.Warn("Feishu SSO callback rejected because state is missing, expired, or does not match")
 		common.ErrorStrResp(c, "incorrect or expired state parameter", 400)
 		return
 	}
@@ -410,14 +421,21 @@ func SSOLoginCallback(c *gin.Context) {
 			}).SetFormData(additionalForm).Post(tokenUrl)
 	}
 	if err != nil {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO token exchange request failed: %v", err)
+		}
 		common.ErrorResp(c, err, 400)
 		return
 	}
 	if resp.IsError() {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO token exchange returned HTTP %s", resp.Status())
+		}
 		common.ErrorStrResp(c, fmt.Sprintf("SSO token exchange failed: %s", resp.Status()), 400)
 		return
 	}
 	if platform == "Feishu" && utils.Json.Get(resp.Body(), "code").ToInt() != 0 {
+		log.Errorf("Feishu SSO token exchange failed: api_code=%d message=%q", utils.Json.Get(resp.Body(), "code").ToInt(), utils.Json.Get(resp.Body(), "msg").ToString())
 		common.ErrorStrResp(c, "Feishu token exchange failed: "+utils.Json.Get(resp.Body(), "msg").ToString(), 400)
 		return
 	}
@@ -427,6 +445,11 @@ func SSOLoginCallback(c *gin.Context) {
 			Get(userUrl)
 	} else {
 		accessToken := utils.Json.Get(resp.Body(), "access_token").ToString()
+		if platform == "Feishu" && accessToken == "" {
+			log.Error("Feishu SSO token exchange succeeded without an access_token")
+			common.ErrorStrResp(c, "Feishu token exchange did not return an access token", 400)
+			return
+		}
 		userInfoRequest := ssoClient.R().SetHeader("Authorization", "Bearer "+accessToken)
 		if platform == "Feishu" {
 			userInfoRequest.SetHeader("Content-Type", "application/json; charset=utf-8")
@@ -435,24 +458,39 @@ func SSOLoginCallback(c *gin.Context) {
 			Get(userUrl)
 	}
 	if err != nil {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO user-info request failed: %v", err)
+		}
 		common.ErrorResp(c, err, 400)
 		return
 	}
 	if resp.IsError() {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO user-info request returned HTTP %s", resp.Status())
+		}
 		common.ErrorStrResp(c, fmt.Sprintf("SSO user-info request failed: %s", resp.Status()), 400)
 		return
 	}
 	if platform == "Feishu" && utils.Json.Get(resp.Body(), "code").ToInt() != 0 {
+		log.Errorf("Feishu SSO user-info request failed: api_code=%d message=%q", utils.Json.Get(resp.Body(), "code").ToInt(), utils.Json.Get(resp.Body(), "msg").ToString())
 		common.ErrorStrResp(c, "Feishu user-info request failed: "+utils.Json.Get(resp.Body(), "msg").ToString(), 400)
 		return
 	}
-	userPath := idField
-	usernamePath := usernameField
+	userID := utils.Json.Get(resp.Body(), idField).ToString()
+	username := utils.Json.Get(resp.Body(), usernameField).ToString()
 	if platform == "Feishu" {
-		userPath = "data." + idField
-		usernamePath = "data." + usernameField
+		// jsoniter expects nested object keys as separate path arguments rather
+		// than a dot-separated string. The latter looked for a literal
+		// "data.open_id" field and caused every successful Feishu callback to
+		// fall through to the generic "error occurred" response.
+		userID = utils.Json.Get(resp.Body(), "data", idField).ToString()
+		username = utils.Json.Get(resp.Body(), "data", usernameField).ToString()
+		if utils.SliceContains([]string{"", "0"}, userID) {
+			log.Errorf("Feishu SSO user-info response is missing data.open_id: data_present=%t name_present=%t", utils.Json.Get(resp.Body(), "data").GetInterface() != nil, username != "")
+			common.ErrorStrResp(c, "Feishu user-info response does not include open_id", 400)
+			return
+		}
 	}
-	userID := utils.Json.Get(resp.Body(), userPath).ToString()
 	if utils.SliceContains([]string{"", "0"}, userID) {
 		common.ErrorResp(c, errors.New("error occurred"), 400)
 		return
@@ -473,18 +511,29 @@ func SSOLoginCallback(c *gin.Context) {
 		c.Data(200, "text/html; charset=utf-8", []byte(html))
 		return
 	}
-	username := utils.Json.Get(resp.Body(), usernamePath).ToString()
 	user, err := db.GetUserBySSOID(userID)
+	autoRegistered := false
 	if err != nil {
 		user, err = autoRegister(username, userID, err)
 		if err != nil {
+			if platform == "Feishu" {
+				log.Errorf("Feishu SSO could not resolve or auto-register the AList user: %v", err)
+			}
 			common.ErrorResp(c, err, 400)
 			return
 		}
+		autoRegistered = true
 	}
 	token, err := common.GenerateToken(user)
 	if err != nil {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO could not generate an AList login token for user_id=%d: %v", user.ID, err)
+		}
 		common.ErrorResp(c, err, 400)
+		return
+	}
+	if platform == "Feishu" {
+		log.Infof("Feishu SSO login succeeded: alist_user_id=%d role_ids=%v auto_registered=%t", user.ID, user.Role, autoRegistered)
 	}
 	if usecompatibility {
 		c.Redirect(302, common.GetApiUrl(c.Request)+"/@login?token="+token)
