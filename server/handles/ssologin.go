@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/alist-org/alist/v3/internal/op"
 	"net/http"
 	"net/url"
 	"path"
@@ -15,7 +14,10 @@ import (
 
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/db"
+	"github.com/alist-org/alist/v3/internal/device"
+	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/internal/setting"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/pkg/utils/random"
@@ -32,6 +34,7 @@ const stateLength = 16
 const stateExpire = time.Minute * 5
 
 var stateCache = cache.NewMemCache[string](cache.WithShards[string](stateLength))
+var stateDeviceCache = cache.NewMemCache[string](cache.WithShards[string](stateLength))
 
 func _keyState(clientID, state string) string {
 	return fmt.Sprintf("%s_%s", clientID, state)
@@ -46,6 +49,24 @@ func generateState(clientID, ip string) string {
 func verifyState(clientID, ip, state string) bool {
 	value, ok := stateCache.Get(_keyState(clientID, state))
 	return ok && value == ip
+}
+
+func rememberStateDevice(clientID, state, deviceID string) {
+	if deviceID != "" {
+		stateDeviceCache.Set(_keyState(clientID, state), deviceID, cache.WithEx[string](stateExpire))
+	}
+}
+
+func consumeStateDevice(clientID, ip, state string) (string, bool) {
+	key := _keyState(clientID, state)
+	value, ok := stateCache.Get(key)
+	if !ok || value != ip {
+		return "", false
+	}
+	stateCache.Del(key)
+	deviceID, _ := stateDeviceCache.Get(key)
+	stateDeviceCache.Del(key)
+	return deviceID, true
 }
 
 func ssoRedirectUri(c *gin.Context, useCompatibility bool, method string) string {
@@ -97,8 +118,16 @@ func SSOLoginRedirect(c *gin.Context) {
 		// OAuth flow starts at accounts.feishu.cn and returns the state verbatim.
 		// Keep state server-side so the callback cannot be replayed or initiated
 		// by a different browser.
+		deviceID := c.Query("device_id")
+		if len(deviceID) > 128 {
+			common.ErrorStrResp(c, "invalid device_id", 400)
+			return
+		}
+		state := generateState(clientId, c.ClientIP())
+		rememberStateDevice(clientId, state, deviceID)
 		rUrl = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
-		urlValues.Add("state", generateState(clientId, c.ClientIP()))
+		urlValues.Add("state", state)
+		log.Infof("Feishu SSO authorization redirect: redirect_uri=%s compatibility_mode=%t", redirectUri, useCompatibility)
 	case "Casdoor":
 		endpoint := strings.TrimSuffix(setting.GetStr(conf.SSOEndpointName), "/")
 		rUrl = endpoint + "/login/oauth/authorize?"
@@ -380,10 +409,15 @@ func SSOLoginCallback(c *gin.Context) {
 		common.ErrorStrResp(c, "No code provided", 400)
 		return
 	}
-	if platform == "Feishu" && !verifyState(clientId, c.ClientIP(), c.Query("state")) {
-		log.Warn("Feishu SSO callback rejected because state is missing, expired, or does not match")
-		common.ErrorStrResp(c, "incorrect or expired state parameter", 400)
-		return
+	deviceID := ""
+	if platform == "Feishu" {
+		var validState bool
+		deviceID, validState = consumeStateDevice(clientId, c.ClientIP(), c.Query("state"))
+		if !validState {
+			log.Warn("Feishu SSO callback rejected because state is missing, expired, already used, or does not match")
+			common.ErrorStrResp(c, "incorrect or expired state parameter", 400)
+			return
+		}
 	}
 	redirectURI := ssoRedirectUri(c, usecompatibility, argument)
 	var resp *resty.Response
@@ -524,6 +558,29 @@ func SSOLoginCallback(c *gin.Context) {
 		}
 		autoRegistered = true
 	}
+	// SSO must activate the same device session as password login.  Without
+	// this, a device previously marked inactive receives a valid JWT but /me
+	// rejects it in the auth middleware with "session inactive".
+	clientID := c.GetHeader("Client-Id")
+	if clientID == "" {
+		clientID = c.Query("client_id")
+	}
+	if clientID == "" {
+		clientID = deviceID
+	}
+	deviceKey := utils.GetMD5EncodeStr(fmt.Sprintf("%d-%s", user.ID, clientID))
+	if err := device.EnsureActiveOnLogin(user.ID, deviceKey, c.Request.UserAgent(), c.ClientIP()); err != nil {
+		if platform == "Feishu" {
+			log.Errorf("Feishu SSO could not activate device session: alist_user_id=%d device_key_prefix=%s error=%v", user.ID, deviceKey[:12], err)
+		}
+		if errors.Is(err, errs.TooManyDevices) {
+			common.ErrorResp(c, err, 403)
+		} else {
+			common.ErrorResp(c, err, 400, true)
+		}
+		return
+	}
+
 	token, err := common.GenerateToken(user)
 	if err != nil {
 		if platform == "Feishu" {
@@ -533,7 +590,7 @@ func SSOLoginCallback(c *gin.Context) {
 		return
 	}
 	if platform == "Feishu" {
-		log.Infof("Feishu SSO login succeeded: alist_user_id=%d role_ids=%v auto_registered=%t", user.ID, user.Role, autoRegistered)
+		log.Infof("Feishu SSO login succeeded: alist_user_id=%d role_ids=%v auto_registered=%t device_key_prefix=%s", user.ID, user.Role, autoRegistered, deviceKey[:12])
 	}
 	if usecompatibility {
 		c.Redirect(302, common.GetApiUrl(c.Request)+"/@login?token="+token)
