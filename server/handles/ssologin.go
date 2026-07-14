@@ -91,6 +91,8 @@ func SSOLoginRedirect(c *gin.Context) {
 		urlValues.Add("scope", "openid")
 		urlValues.Add("prompt", "consent")
 		urlValues.Add("response_type", "code")
+	case "Feishu":
+		rUrl = "https://passport.feishu.cn/suite/passport/oauth/authorize?"
 	case "Casdoor":
 		endpoint := strings.TrimSuffix(setting.GetStr(conf.SSOEndpointName), "/")
 		rUrl = endpoint + "/login/oauth/authorize?"
@@ -331,6 +333,13 @@ func SSOLoginCallback(c *gin.Context) {
 		authField = "authCode"
 		idField = "unionId"
 		usernameField = "nick"
+	case "Feishu":
+		tokenUrl = "https://passport.feishu.cn/suite/passport/oauth/token"
+		userUrl = "https://passport.feishu.cn/suite/passport/oauth/userinfo"
+		additionalForm["grant_type"] = "authorization_code"
+		authField = "code"
+		idField = "sub"
+		usernameField = "name"
 	case "Casdoor":
 		endpoint := strings.TrimSuffix(setting.GetStr(conf.SSOEndpointName), "/")
 		tokenUrl = endpoint + "/api/login/oauth/access_token"

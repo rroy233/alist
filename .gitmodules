@@ -1,0 +1,3 @@
+[submodule "alist-web"]
+	path = alist-web
+	url = https://github.com/rroy233/alist-web
