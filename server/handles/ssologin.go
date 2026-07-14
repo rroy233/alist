@@ -92,7 +92,12 @@ func SSOLoginRedirect(c *gin.Context) {
 		urlValues.Add("prompt", "consent")
 		urlValues.Add("response_type", "code")
 	case "Feishu":
-		rUrl = "https://passport.feishu.cn/suite/passport/oauth/authorize?"
+		// Feishu's legacy passport endpoints have been deprecated. The current
+		// OAuth flow starts at accounts.feishu.cn and returns the state verbatim.
+		// Keep state server-side so the callback cannot be replayed or initiated
+		// by a different browser.
+		rUrl = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
+		urlValues.Add("state", generateState(clientId, c.ClientIP()))
 	case "Casdoor":
 		endpoint := strings.TrimSuffix(setting.GetStr(conf.SSOEndpointName), "/")
 		rUrl = endpoint + "/login/oauth/authorize?"
@@ -334,11 +339,11 @@ func SSOLoginCallback(c *gin.Context) {
 		idField = "unionId"
 		usernameField = "nick"
 	case "Feishu":
-		tokenUrl = "https://passport.feishu.cn/suite/passport/oauth/token"
-		userUrl = "https://passport.feishu.cn/suite/passport/oauth/userinfo"
+		tokenUrl = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
+		userUrl = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 		additionalForm["grant_type"] = "authorization_code"
 		authField = "code"
-		idField = "sub"
+		idField = "open_id"
 		usernameField = "name"
 	case "Casdoor":
 		endpoint := strings.TrimSuffix(setting.GetStr(conf.SSOEndpointName), "/")
@@ -358,9 +363,18 @@ func SSOLoginCallback(c *gin.Context) {
 	}
 	callbackCode := c.Query(authField)
 	if callbackCode == "" {
+		if platform == "Feishu" && c.Query("error") != "" {
+			common.ErrorStrResp(c, "Feishu authorization failed: "+c.Query("error"), 400)
+			return
+		}
 		common.ErrorStrResp(c, "No code provided", 400)
 		return
 	}
+	if platform == "Feishu" && !verifyState(clientId, c.ClientIP(), c.Query("state")) {
+		common.ErrorStrResp(c, "incorrect or expired state parameter", 400)
+		return
+	}
+	redirectURI := ssoRedirectUri(c, usecompatibility, argument)
 	var resp *resty.Response
 	var err error
 	if platform == "Dingtalk" {
@@ -372,24 +386,39 @@ func SSOLoginCallback(c *gin.Context) {
 				"grantType":    "authorization_code",
 			}).
 			Post(tokenUrl)
+	} else if platform == "Feishu" {
+		// The current Feishu token endpoint accepts a JSON request body. The
+		// legacy endpoint accepted a form body, which is why the old integration
+		// reached the callback but never produced a usable AList login token.
+		resp, err = ssoClient.R().SetHeader("Content-Type", "application/json; charset=utf-8").
+			SetHeader("Accept", "application/json").
+			SetBody(map[string]string{
+				"grant_type":    "authorization_code",
+				"client_id":     clientId,
+				"client_secret": clientSecret,
+				"code":          callbackCode,
+				"redirect_uri":  redirectURI,
+			}).Post(tokenUrl)
 	} else {
-		var redirect_uri string
-		if usecompatibility {
-			redirect_uri = common.GetApiUrl(c.Request) + "/api/auth/" + argument
-		} else {
-			redirect_uri = common.GetApiUrl(c.Request) + "/api/auth/sso_callback" + "?method=" + argument
-		}
 		resp, err = ssoClient.R().SetHeader("Accept", "application/json").
 			SetFormData(map[string]string{
 				"client_id":     clientId,
 				"client_secret": clientSecret,
 				"code":          callbackCode,
-				"redirect_uri":  redirect_uri,
+				"redirect_uri":  redirectURI,
 				"scope":         scope,
 			}).SetFormData(additionalForm).Post(tokenUrl)
 	}
 	if err != nil {
 		common.ErrorResp(c, err, 400)
+		return
+	}
+	if resp.IsError() {
+		common.ErrorStrResp(c, fmt.Sprintf("SSO token exchange failed: %s", resp.Status()), 400)
+		return
+	}
+	if platform == "Feishu" && utils.Json.Get(resp.Body(), "code").ToInt() != 0 {
+		common.ErrorStrResp(c, "Feishu token exchange failed: "+utils.Json.Get(resp.Body(), "msg").ToString(), 400)
 		return
 	}
 	if platform == "Dingtalk" {
@@ -398,14 +427,32 @@ func SSOLoginCallback(c *gin.Context) {
 			Get(userUrl)
 	} else {
 		accessToken := utils.Json.Get(resp.Body(), "access_token").ToString()
-		resp, err = ssoClient.R().SetHeader("Authorization", "Bearer "+accessToken).
+		userInfoRequest := ssoClient.R().SetHeader("Authorization", "Bearer "+accessToken)
+		if platform == "Feishu" {
+			userInfoRequest.SetHeader("Content-Type", "application/json; charset=utf-8")
+		}
+		resp, err = userInfoRequest.
 			Get(userUrl)
 	}
 	if err != nil {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	userID := utils.Json.Get(resp.Body(), idField).ToString()
+	if resp.IsError() {
+		common.ErrorStrResp(c, fmt.Sprintf("SSO user-info request failed: %s", resp.Status()), 400)
+		return
+	}
+	if platform == "Feishu" && utils.Json.Get(resp.Body(), "code").ToInt() != 0 {
+		common.ErrorStrResp(c, "Feishu user-info request failed: "+utils.Json.Get(resp.Body(), "msg").ToString(), 400)
+		return
+	}
+	userPath := idField
+	usernamePath := usernameField
+	if platform == "Feishu" {
+		userPath = "data." + idField
+		usernamePath = "data." + usernameField
+	}
+	userID := utils.Json.Get(resp.Body(), userPath).ToString()
 	if utils.SliceContains([]string{"", "0"}, userID) {
 		common.ErrorResp(c, errors.New("error occurred"), 400)
 		return
@@ -426,7 +473,7 @@ func SSOLoginCallback(c *gin.Context) {
 		c.Data(200, "text/html; charset=utf-8", []byte(html))
 		return
 	}
-	username := utils.Json.Get(resp.Body(), usernameField).ToString()
+	username := utils.Json.Get(resp.Body(), usernamePath).ToString()
 	user, err := db.GetUserBySSOID(userID)
 	if err != nil {
 		user, err = autoRegister(username, userID, err)
